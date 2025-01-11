@@ -12,32 +12,32 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aojea/kindnet/pkg/network"
+	"github.com/florianl/go-nfqueue"
+	"github.com/google/logger"
+	"github.com/google/nftables"
+	"github.com/google/nftables/binaryutil"
+	"github.com/google/nftables/expr"
+	"github.com/mdlayher/netlink"
 
-	"github.com/vishvananda/netlink"
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/sys/unix"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apimachinery/pkg/util/wait"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	v1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	utilio "k8s.io/utils/io"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/knftables"
 )
 
 // reference https://coredns.io/plugins/cache/
 const (
-	maxResolvConfLength = 10 * 1 << 20 // 10MB
+	tableName = "kindnet-dnscache"
+	queueID   = 103
 	// same as LocalNodeDNS
 	// https://github.com/kubernetes/dns/blob/c0fa2d1128d42c9b13e08a6a7e3ee8c635b9acd5/cmd/node-cache/Corefile#L3
-	expireTimeout    = 30 * time.Second
-	tproxyBypassMark = 12
-	tproxyMark       = 11
-	tproxyTable      = 100
+	expireTimeout = 30 * time.Second
 	// It was 512 byRFC1035 for UDP until EDNS, but large packets can be fragmented ...
 	// it seems bind uses 1232 as maximum size
 	// https://kb.isc.org/docs/behavior-dig-versions-edns-bufsize
@@ -197,86 +197,90 @@ func (d *DNSCacheAgent) Run(ctx context.Context) error {
 	d.searches = hostSearch
 	klog.V(2).Infof("Parsed resolv.conf: nameservers: %v search: %v options: %v", hostDNS, hostSearch, hostOptions)
 
-	klog.Info("Waiting for node parameters")
-	err = wait.PollUntilContextCancel(ctx, 1*time.Second, true, func(context.Context) (bool, error) {
-		node, err := d.nodeLister.Get(d.nodeName)
+	var flags uint32
+	// https://netfilter.org/projects/libnetfilter_queue/doxygen/html/group__Queue.html
+	// the kernel will not normalize offload packets,
+	// i.e. your application will need to be able to handle packets larger than the mtu.
+	// Normalization is expensive, so this flag should always be set.
+	// This also solves a bug with SCTP
+	// https://github.com/aojea/kube-netpol/issues/8
+	// https://bugzilla.netfilter.org/show_bug.cgi?id=1742
+	flags = nfqueue.NfQaCfgFlagGSO
+	if c.config.FailOpen {
+		flags += nfqueue.NfQaCfgFlagFailOpen
+	}
+
+	// Set configuration options for nfqueue
+	config := nfqueue.Config{
+		NfQueue:      uint16(c.config.QueueID),
+		Flags:        flags,
+		MaxPacketLen: 128, // only interested in the headers
+		MaxQueueLen:  1024,
+		Copymode:     nfqueue.NfQnlCopyPacket, // headers
+		WriteTimeout: 100 * time.Millisecond,
+	}
+
+	nf, err := nfqueue.Open(&config)
+	if err != nil {
+		logger.Info("could not open nfqueue socket", "error", err)
+		return err
+	}
+	defer nf.Close()
+
+	c.nfq = nf
+
+	// Parse the packet and check if it should be accepted
+	// Packets should be evaludated independently in each direction
+	fn := func(a nfqueue.Attribute) int {
+		verdict := nfqueue.NfDrop
+		if c.config.FailOpen {
+			verdict = nfqueue.NfAccept
+		}
+
+		startTime := time.Now()
+		logger.V(2).Info("Processing sync for packet", "id", *a.PacketID)
+
+		packet, err := parsePacket(*a.Payload)
 		if err != nil {
-			return false, nil
+			logger.Error(err, "Can not process packet, applying default policy", "id", *a.PacketID, "failOpen", c.config.FailOpen)
+			c.nfq.SetVerdict(*a.PacketID, verdict) //nolint:errcheck
+			return 0
 		}
-		podCIDRsv4, podCIDRsv6 := network.SplitCIDRslice(node.Spec.PodCIDRs)
-		klog.V(7).Infof("Got %v and %v from node %s", podCIDRsv4, podCIDRsv6, node.Name)
-		if len(podCIDRsv4) > 0 {
-			d.podCIDRv4 = podCIDRsv4[0]
+		packet.id = *a.PacketID
+
+		defer func() {
+			processingTime := float64(time.Since(startTime).Microseconds())
+			packetProcessingHist.WithLabelValues(string(packet.proto), string(packet.family)).Observe(processingTime)
+			packetProcessingSum.Observe(processingTime)
+			verdictStr := verdictString(verdict)
+			packetCounterVec.WithLabelValues(string(packet.proto), string(packet.family), verdictStr).Inc()
+			logger.V(2).Info("Finished syncing packet", "id", *a.PacketID, "duration", time.Since(startTime), "verdict", verdictStr)
+		}()
+
+		if c.evaluatePacket(ctx, packet) {
+			verdict = nfqueue.NfAccept
+		} else {
+			verdict = nfqueue.NfDrop
 		}
-		if len(podCIDRsv6) > 0 {
-			d.podCIDRv6 = podCIDRsv6[0]
+		c.nfq.SetVerdict(*a.PacketID, verdict) //nolint:errcheck
+		return 0
+	}
+
+	// Register your function to listen on nflog group 100
+	err = nf.RegisterWithErrorFunc(ctx, fn, func(err error) int {
+		if opError, ok := err.(*netlink.OpError); ok {
+			if opError.Timeout() || opError.Temporary() {
+				return 0
+			}
 		}
-		return true, nil
+		logger.Info("Could not receive message", "error", err)
+		return 0
 	})
 	if err != nil {
+		logger.Info("could not open nfqueue socket", "error", err)
 		return err
 	}
 
-	bypassDialer := &net.Dialer{
-		Control: func(network, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				// Mark connections so thet are not processed by the netfilter TPROXY rules
-				if err := unix.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, tproxyBypassMark); err != nil {
-					klog.Infof("setting SO_MARK bypass: %v", err)
-				}
-			})
-		},
-	}
-
-	d.resolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			// TODO check multiple nameservers
-			return bypassDialer.Dial(network, net.JoinHostPort(d.nameServer, "53"))
-		},
-	}
-
-	// start listener
-	lc := net.ListenConfig{Control: func(network, address string, c syscall.RawConn) error {
-		return c.Control(func(fd uintptr) {
-			if err := unix.SetsockoptInt(int(fd), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
-				klog.Fatalf("error setting IP_TRANSPARENT bypass: %v", err)
-			}
-		})
-	},
-	}
-
-	conn, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	d.localAddr = conn.LocalAddr().String()
-	klog.V(2).Infof("listening on %s", d.localAddr)
-
-	go func() {
-		for {
-			// It was 512 until EDNS but large packets can be fragmented ...
-			// https://kb.isc.org/docs/behavior-dig-versions-edns-bufsize
-			buf := make([]byte, maxDNSSize)
-			n, addr, err := conn.ReadFrom(buf)
-			if err != nil {
-				klog.Infof("error on UDP connection: %v", err)
-				continue
-			}
-			klog.V(7).Infof("UDP connection from %s", addr.String())
-			go d.serveDNS(addr, buf[:n])
-		}
-	}()
-
-	klog.Info("Syncing local route rules")
-	err = d.syncLocalRoute()
-	if err != nil {
-		klog.Infof("error syncing local route: %v", err)
-	}
-
-	klog.Info("Syncing nftables rules")
 	errs := 0
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
@@ -336,124 +340,47 @@ func (d *DNSCacheAgent) serveDNS(addr net.Addr, data []byte) {
 	}
 }
 
-func (d *DNSCacheAgent) syncLocalRoute() error {
-	link, err := netlink.LinkByName("lo")
-	if err != nil {
-		return fmt.Errorf("failed to find 'lo' link: %v", err)
-	}
-
-	r := netlink.NewRule()
-	r.Family = unix.AF_INET // TODO IPv6
-	r.Table = tproxyTable
-	r.Mark = tproxyMark
-	if err := netlink.RuleAdd(r); err != nil {
-		return fmt.Errorf("failed to configure netlink rule: %v", err)
-	}
-
-	_, dst, err := net.ParseCIDR(d.nameServer + "/32") // TODO IPv6
-	if err != nil {
-		return fmt.Errorf("parse CIDR: %v", err)
-	}
-
-	err = netlink.RouteAdd(&netlink.Route{
-		Dst:       dst,
-		Scope:     netlink.SCOPE_HOST,
-		Type:      unix.RTN_LOCAL,
-		Table:     tproxyTable,
-		LinkIndex: link.Attrs().Index,
-	})
-	if err != nil {
-		if !strings.Contains(strings.ToLower(err.Error()), "file exists") {
-			return fmt.Errorf("failed to add route: %v", err)
-		}
-
-	}
-	return nil
-}
-
 // SyncRules syncs ip masquerade rules
 func (d *DNSCacheAgent) SyncRules(ctx context.Context) error {
-	table := &knftables.Table{
-		Comment: knftables.PtrTo("rules for kindnet dnscache"),
+	klog.FromContext(ctx).Info("Syncing nftables rules")
+	nft, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("can not start nftables:%v", err)
 	}
-	tx := d.nft.NewTransaction()
-	// do it once to delete the existing table
-	if !d.flushed {
-		tx.Add(table)
-		tx.Delete(table)
-		d.flushed = true
-	}
-	tx.Add(table)
-
-	hook := knftables.PreroutingHook
-	chainName := string(hook)
-	tx.Add(&knftables.Chain{
-		Name: chainName,
-		Type: knftables.PtrTo(knftables.FilterType),
-		Hook: knftables.PtrTo(hook),
-		// before conntrack to avoid tproxied traffic to be natted
-		// https://wiki.nftables.org/wiki-nftables/index.php/Setting_packet_connection_tracking_metainformation
-		// https://wiki.nftables.org/wiki-nftables/index.php/Netfilter_hooks
-		Priority: knftables.PtrTo(knftables.RawPriority + "-10"),
-	})
-	tx.Flush(&knftables.Chain{
-		Name: chainName,
-	})
-	// bypass mark
-	tx.Add(&knftables.Rule{
-		Chain: chainName,
-		Rule: knftables.Concat(
-			"meta", "mark", tproxyBypassMark, "return",
-		),
-	})
-
-	// process coming from Pods destined to the DNS server
-	// https://www.netfilter.org/projects/nftables/manpage.html
-	// TODO: obtain the DNS server for the Pods from the kubelet config
-	// Port 10250/configz ??
-	if d.podCIDRv4 != "" {
-		// only packets destined to the cluster DNS server from the Pods
-		tx.Add(&knftables.Rule{
-			Chain: chainName,
-			Rule: knftables.Concat(
-				"ip saddr", d.podCIDRv4,
-				"ip daddr", d.nameServer,
-				"meta l4proto udp th dport 53",
-				"tproxy ip to", d.localAddr,
-				"meta mark set", tproxyMark,
-				"notrack",
-				"accept",
-			), // set a mark to check if there is abug in the kernel when creating the entire expression
-			Comment: ptr.To("DNS IPv4 pod originated traffic"),
-		})
+	// add + delete + add for flushing all the table
+	table := &nftables.Table{
+		Name:   tableName,
+		Family: nftables.TableFamilyINet,
 	}
 
-	if d.podCIDRv6 != "" {
-		// only packets destined to the cluster DNS server
-		tx.Add(&knftables.Rule{
-			Chain: chainName,
-			Rule: knftables.Concat(
-				"ip6 saddr", d.podCIDRv6,
-				"ip6 daddr", d.nameServer,
-				"meta l4proto udp th dport 53",
-				"tproxy ip6 to", d.localAddr,
-				"meta mark set", tproxyMark,
-				"notrack",
-				"accept",
-			),
-			Comment: ptr.To("DNS IPv6 pod originated traffic"),
-		})
-	}
+	nft.AddTable(table)
+	nft.DelTable(table)
+	nft.AddTable(table)
 
-	// stop processing tproxied traffic
-	tx.Add(&knftables.Rule{
-		Chain: chainName,
-		Rule: knftables.Concat(
-			"meta", "mark", tproxyMark, "drop",
-		),
+	chain := nft.AddChain(&nftables.Chain{
+		Name:     "prerouting",
+		Table:    table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookPrerouting, // packets not generated on the hosts
+		Priority: nftables.ChainPriorityRaw,    // just before conntrack
 	})
 
-	if err := d.nft.Run(ctx, tx); err != nil {
+	// TODO: restrict this more, maybe iiftype == veth, we want to handle the traffic
+	// from the Pods to dns servers out of the own host, as it is unlikely that caching/proxying the local traffic will add any benefit.
+	// udp dport 53 queue flag bypass
+	nft.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyL4PROTO, SourceRegister: false, Register: 0x1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 0x1, Data: []byte{unix.IPPROTO_UDP}},
+			&expr.Payload{DestRegister: 0x1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 0x1, Data: binaryutil.BigEndian.PutUint16(53)},
+			&expr.Queue{Num: queueID, Flag: expr.QueueFlagBypass},
+		},
+	})
+
+	if err := nft.Flush(); err != nil {
 		klog.Infof("error syncing nftables rules %v", err)
 		return err
 	}
@@ -461,13 +388,21 @@ func (d *DNSCacheAgent) SyncRules(ctx context.Context) error {
 }
 
 func (d *DNSCacheAgent) CleanRules() {
-	tx := d.nft.NewTransaction()
-	// Add+Delete is idempotent and won't return an error if the table doesn't already
+	nft, err := nftables.New()
+	if err != nil {
+		klog.Errorf("can not start nftables:%v", err)
+		return
+	} // Add+Delete is idempotent and won't return an error if the table doesn't already
 	// exist.
-	tx.Add(&knftables.Table{})
-	tx.Delete(&knftables.Table{})
+	table := &nftables.Table{
+		Name:   tableName,
+		Family: nftables.TableFamilyINet,
+	}
 
-	if err := d.nft.Run(context.TODO(), tx); err != nil {
+	nft.AddTable(table)
+	nft.DelTable(table)
+
+	if err := nft.Flush(); err != nil {
 		klog.Infof("error deleting nftables rules %v", err)
 	}
 }
